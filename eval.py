@@ -157,11 +157,8 @@ def train_experiment(quick: bool = False):
         return preds
     
     # =========================================================================
-    # Data Generation - ARC-style Conditioning
+    # Data Generation (copied from data_gen.py for Modal)
     # =========================================================================
-    # Each task has: shared (dx,dy), multiple train pairs, one test pair
-    # Model sees (train_inputs, train_outputs, test_input) -> predicts test_output
-    # This makes dx,dy inferable from context!
     
     def generate_polyomino(size, rng):
         if size <= 0:
@@ -219,6 +216,7 @@ def train_experiment(quick: bool = False):
         available_colors = list(range(1, 10))
         rng.shuffle(available_colors)
         
+        # Main objects
         for _ in range(n_objects):
             if not available_colors:
                 break
@@ -270,8 +268,7 @@ def train_experiment(quick: bool = False):
         
         return grid, objects
     
-    def get_valid_translations(grid, objects, max_t):
-        """Get all valid translations for a scene."""
+    def sample_valid_translation(grid, objects, max_t, rng):
         H, W = grid.shape
         all_cells = []
         for obj in objects:
@@ -280,7 +277,7 @@ def train_experiment(quick: bool = False):
                 all_cells.append((r0 + dr, c0 + dc))
         
         if not all_cells:
-            return []
+            return None
         
         min_r, max_r = min(c[0] for c in all_cells), max(c[0] for c in all_cells)
         min_c, max_c = min(c[1] for c in all_cells), max(c[1] for c in all_cells)
@@ -288,8 +285,10 @@ def train_experiment(quick: bool = False):
         dx_min, dx_max = max(-max_t, -min_r), min(max_t, H - 1 - max_r)
         dy_min, dy_max = max(-max_t, -min_c), min(max_t, W - 1 - max_c)
         
-        return [(dx, dy) for dx in range(dx_min, dx_max + 1) 
-                for dy in range(dy_min, dy_max + 1) if dx != 0 or dy != 0]
+        valid = [(dx, dy) for dx in range(dx_min, dx_max + 1) 
+                 for dy in range(dy_min, dy_max + 1) if dx != 0 or dy != 0]
+        
+        return valid[rng.integers(len(valid))] if valid else None
     
     def translate_scene(grid, objects, dx, dy):
         H, W = grid.shape
@@ -302,119 +301,29 @@ def train_experiment(quick: bool = False):
                     new_grid[new_r, new_c] = obj['color']
         return new_grid
     
-    def generate_arc_task(grid_size, n_objects_range, n_train_pairs, rng):
-        """
-        Generate one ARC-style task:
-        - Sample a single (dx, dy) for the whole task
-        - Generate n_train_pairs train examples + 1 test example
-        - All share the same translation rule
-        
-        Returns:
-            train_inputs: (n_train, H, W)
-            train_outputs: (n_train, H, W)
-            test_input: (H, W)
-            test_output: (H, W)
-            translation: (dx, dy)
-        """
-        max_attempts = 50
-        
-        for _ in range(max_attempts):
-            # Sample translation for this task
-            dx = rng.integers(-3, 4)
-            dy = rng.integers(-3, 4)
-            if dx == 0 and dy == 0:
-                continue
-            
-            train_inputs = []
-            train_outputs = []
-            
-            # Generate train pairs
-            success = True
-            for _ in range(n_train_pairs):
-                n_objects = rng.integers(n_objects_range[0], n_objects_range[1] + 1)
-                
-                # Try to generate a scene where this translation is valid
-                for _ in range(20):
-                    scene, objects = generate_scene(grid_size, n_objects, rng)
-                    if not objects:
-                        continue
-                    
-                    valid_trans = get_valid_translations(scene, objects, 3)
-                    if (dx, dy) in valid_trans:
-                        output = translate_scene(scene, objects, dx, dy)
-                        train_inputs.append(scene)
-                        train_outputs.append(output)
-                        break
-                else:
-                    success = False
-                    break
-            
-            if not success or len(train_inputs) < n_train_pairs:
-                continue
-            
-            # Generate test example with same translation
-            n_objects = rng.integers(n_objects_range[0], n_objects_range[1] + 1)
-            for _ in range(20):
-                scene, objects = generate_scene(grid_size, n_objects, rng)
-                if not objects:
-                    continue
-                valid_trans = get_valid_translations(scene, objects, 3)
-                if (dx, dy) in valid_trans:
-                    test_input = scene
-                    test_output = translate_scene(scene, objects, dx, dy)
-                    
-                    return (
-                        np.stack(train_inputs),
-                        np.stack(train_outputs),
-                        test_input,
-                        test_output,
-                        (dx, dy)
-                    )
-        
-        return None  # Failed to generate task
-    
-    def generate_batch_arc_style(batch_size, grid_size, n_objects_range, n_train_pairs, rng):
-        """
-        Generate a batch of ARC-style tasks.
-        
-        Returns:
-            context: (batch, n_train_pairs * 2 + 1, H, W) - stacked [train_in, train_out, ..., test_in]
-            targets: (batch, H, W) - test outputs
-            translations: list of (dx, dy) per task
-        """
-        # Context channels: train_in1, train_out1, train_in2, train_out2, test_in
-        n_context = n_train_pairs * 2 + 1
-        
-        context = np.zeros((batch_size, n_context, grid_size, grid_size), dtype=np.int64)
-        targets = np.zeros((batch_size, grid_size, grid_size), dtype=np.int64)
-        translations = []
+    def generate_batch(batch_size, grid_size, n_objects_range, rng):
+        inputs = np.zeros((batch_size, grid_size, grid_size), dtype=np.int64)
+        outputs = np.zeros((batch_size, grid_size, grid_size), dtype=np.int64)
         
         for i in range(batch_size):
-            task = generate_arc_task(grid_size, n_objects_range, n_train_pairs, rng)
-            if task is None:
-                # Fallback: empty task
-                translations.append((0, 0))
-                continue
-            
-            train_in, train_out, test_in, test_out, trans = task
-            
-            # Stack context: [train_in_1, train_out_1, train_in_2, train_out_2, test_in]
-            for j in range(n_train_pairs):
-                context[i, j * 2] = train_in[j]
-                context[i, j * 2 + 1] = train_out[j]
-            context[i, -1] = test_in
-            
-            targets[i] = test_out
-            translations.append(trans)
+            n_objects = rng.integers(n_objects_range[0], n_objects_range[1] + 1)
+            for _ in range(10):
+                input_grid, objects = generate_scene(grid_size, n_objects, rng)
+                if not objects:
+                    continue
+                translation = sample_valid_translation(input_grid, objects, 3, rng)
+                if translation:
+                    dx, dy = translation
+                    output_grid = translate_scene(input_grid, objects, dx, dy)
+                    inputs[i] = input_grid
+                    outputs[i] = output_grid
+                    break
         
-        return context, targets, translations
+        return inputs, outputs
     
     # =========================================================================
-    # Model (PyTorch) - Context-Conditioned for ARC-style tasks
+    # Model (PyTorch version)
     # =========================================================================
-    # Input: (batch, n_context, H, W) where n_context = 2*n_train_pairs + 1
-    # Context grids are: [train_in_1, train_out_1, ..., test_in]
-    # Output: (batch, H, W, n_colors) logits for test_output
     
     class RelativePositionBias2D(nn.Module):
         def __init__(self, n_heads, max_offset):
@@ -438,30 +347,13 @@ def train_experiment(quick: bool = False):
             
             return self.row_bias[:, rel_rows] + self.col_bias[:, rel_cols]
     
-    class ARCTransformerConditioned(nn.Module):
-        """
-        Transformer that takes context (train pairs) + test input.
-        
-        Architecture: Channel-stacked context approach
-        - Each cell gets features from all context grids
-        - Embeddings for: color (10) × grid_type (5: train_in, train_out, test_in)
-        - Cross-attention between positions to infer the rule
-        """
-        def __init__(self, n_colors=10, n_context=5, d_model=128, n_heads=4, 
-                     n_layers=4, d_ff=256, max_offset=8):
+    class ARCTransformer(nn.Module):
+        def __init__(self, n_colors=10, d_model=128, n_heads=4, n_layers=4, d_ff=256, max_offset=8):
             super().__init__()
             self.d_model = d_model
             self.n_heads = n_heads
-            self.n_context = n_context
             
-            # Color embedding
-            self.color_embed = nn.Embedding(n_colors, d_model // 2)
-            
-            # Grid type embedding (which context grid is this from)
-            self.grid_type_embed = nn.Embedding(n_context, d_model // 2)
-            
-            # Project stacked embeddings to d_model
-            self.input_proj = nn.Linear(n_context * d_model, d_model)
+            self.embedding = nn.Embedding(n_colors, d_model)
             
             self.blocks = nn.ModuleList([
                 nn.ModuleDict({
@@ -481,43 +373,17 @@ def train_experiment(quick: bool = False):
             self.ln_final = nn.LayerNorm(d_model)
             self.output_proj = nn.Linear(d_model, n_colors)
         
-        def forward(self, context):
-            """
-            context: (batch, n_context, H, W) - stacked grids with color indices
-            Returns: (batch, H, W, n_colors) - logits for test output
-            """
-            batch, n_ctx, H, W = context.shape
+        def forward(self, x):
+            batch, H, W = x.shape
             seq_len = H * W
             
-            # Embed each context grid separately
-            # context: (batch, n_ctx, H, W)
-            # Flatten spatial: (batch, n_ctx, H*W)
-            context_flat = context.view(batch, n_ctx, seq_len)
+            h = self.embedding(x.view(batch, -1))
             
-            # Color embeddings: (batch, n_ctx, seq_len, d_model//2)
-            color_emb = self.color_embed(context_flat)
-            
-            # Grid type embeddings: (batch, n_ctx, seq_len, d_model//2)
-            grid_types = torch.arange(n_ctx, device=context.device)
-            grid_type_emb = self.grid_type_embed(grid_types)  # (n_ctx, d_model//2)
-            grid_type_emb = grid_type_emb[None, :, None, :].expand(batch, -1, seq_len, -1)
-            
-            # Combine color + grid type
-            combined = torch.cat([color_emb, grid_type_emb], dim=-1)  # (batch, n_ctx, seq_len, d_model)
-            
-            # Stack all context grids for each position
-            # (batch, n_ctx, seq_len, d_model) -> (batch, seq_len, n_ctx * d_model)
-            combined = combined.permute(0, 2, 1, 3).reshape(batch, seq_len, n_ctx * self.d_model)
-            
-            # Project to model dimension
-            h = self.input_proj(combined)  # (batch, seq_len, d_model)
-            
-            # Transformer blocks
             for block in self.blocks:
                 h_norm = block['ln1'](h)
                 
-                # Attention with relative position bias
-                rel_bias = block['rel_pos'](H, W, context.device)
+                # Custom attention with relative position bias
+                rel_bias = block['rel_pos'](H, W, x.device)
                 
                 # Manual attention with bias
                 Q = h_norm @ block['attn'].in_proj_weight[:self.d_model].T + block['attn'].in_proj_bias[:self.d_model]
@@ -549,16 +415,13 @@ def train_experiment(quick: bool = False):
     # =========================================================================
     
     # Config
-    n_train_pairs = 2  # Number of train examples per task
-    n_context = n_train_pairs * 2 + 1  # train_in, train_out pairs + test_in
-    
     if quick:
-        n_epochs = 10
+        n_epochs = 5
         train_steps_per_epoch = 100
         val_steps = 20
         batch_size = 32
     else:
-        n_epochs = 30
+        n_epochs = 20
         train_steps_per_epoch = 500
         val_steps = 50
         batch_size = 64
@@ -568,15 +431,14 @@ def train_experiment(quick: bool = False):
     lr = 3e-4
     
     print(f"\n{'='*60}")
-    print("Training ARC Translation Model (Context-Conditioned)")
+    print("Training ARC Translation Model")
     print(f"{'='*60}")
     print(f"Grid size: {grid_size}x{grid_size}")
     print(f"Objects: {n_objects_range}")
-    print(f"Train pairs per task: {n_train_pairs}")
     print(f"Epochs: {n_epochs}, Steps/epoch: {train_steps_per_epoch}")
     
-    # Model - context-conditioned
-    model = ARCTransformerConditioned(n_context=n_context).to(device)
+    # Model
+    model = ARCTransformer().to(device)
     model = torch.compile(model)
     
     n_params = sum(p.numel() for p in model.parameters())
@@ -587,7 +449,7 @@ def train_experiment(quick: bool = False):
     
     rng = np.random.default_rng(42)
     history = []
-    best_exact_match = 0
+    best_acc = 0
     
     start_time = time.time()
     
@@ -596,86 +458,59 @@ def train_experiment(quick: bool = False):
         train_loss = 0
         train_correct = 0
         train_total = 0
-        train_fg_pred = 0  # Track foreground predictions
-        train_fg_target = 0
         
         for step in range(train_steps_per_epoch):
-            context, targets, _ = generate_batch_arc_style(
-                batch_size, grid_size, n_objects_range, n_train_pairs, rng
-            )
-            context = torch.from_numpy(context).to(device)
+            inputs, targets = generate_batch(batch_size, grid_size, n_objects_range, rng)
+            inputs = torch.from_numpy(inputs).to(device)
             targets = torch.from_numpy(targets).to(device)
             
             optimizer.zero_grad()
-            logits = model(context)
+            logits = model(inputs)
             loss = F.cross_entropy(logits.view(-1, 10), targets.view(-1))
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
             
-            preds = logits.argmax(-1)
             train_loss += loss.item()
-            train_correct += (preds == targets).sum().item()
+            train_correct += (logits.argmax(-1) == targets).sum().item()
             train_total += targets.numel()
-            
-            # Track foreground collapse diagnostic
-            train_fg_pred += (preds != 0).sum().item()
-            train_fg_target += (targets != 0).sum().item()
         
-        # Validation with proper metrics
+        # Validation
         model.eval()
-        val_preds_all = []
-        val_targets_all = []
-        val_context_all = []
+        val_correct = 0
+        val_total = 0
         
         with torch.no_grad():
             for _ in range(val_steps):
-                context, targets, _ = generate_batch_arc_style(
-                    batch_size, grid_size, n_objects_range, n_train_pairs, rng
-                )
-                context_t = torch.from_numpy(context).to(device)
+                inputs, targets = generate_batch(batch_size, grid_size, n_objects_range, rng)
+                inputs = torch.from_numpy(inputs).to(device)
+                targets = torch.from_numpy(targets).to(device)
                 
-                logits = model(context_t)
-                preds = logits.argmax(-1).cpu().numpy()
-                
-                val_preds_all.append(preds)
-                val_targets_all.append(targets)
-                val_context_all.append(context)
-        
-        val_preds = np.concatenate(val_preds_all)
-        val_targets = np.concatenate(val_targets_all)
-        
-        # Compute proper metrics
-        val_metrics = compute_metrics(val_preds, val_targets)
+                logits = model(inputs)
+                val_correct += (logits.argmax(-1) == targets).sum().item()
+                val_total += targets.numel()
         
         train_loss /= train_steps_per_epoch
         train_acc = train_correct / train_total
-        fg_ratio = train_fg_pred / max(train_fg_target, 1)  # Should be ~1.0 if not collapsing
+        val_acc = val_correct / val_total
         
         history.append({
             'epoch': epoch + 1,
             'train_loss': train_loss,
-            'train_cell_acc': train_acc,
-            'val_exact_match': val_metrics['exact_match'],
-            'val_fg_acc': val_metrics['foreground_acc'],
-            'val_obj_iou': val_metrics['object_iou'],
-            'fg_ratio': fg_ratio,
+            'train_acc': train_acc,
+            'val_acc': val_acc,
         })
         
-        print(f"Epoch {epoch+1:2d} | Loss: {train_loss:.4f} | "
-              f"Exact: {val_metrics['exact_match']:.3f} | "
-              f"FG: {val_metrics['foreground_acc']:.3f} | "
-              f"IoU: {val_metrics['object_iou']:.3f} | "
-              f"FG_ratio: {fg_ratio:.2f}")
+        print(f"Epoch {epoch+1:2d} | Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}")
         
-        if val_metrics['exact_match'] > best_exact_match:
-            best_exact_match = val_metrics['exact_match']
+        if val_acc > best_acc:
+            best_acc = val_acc
             torch.save(model.state_dict(), "/outputs/best_model.pt")
     
     elapsed = time.time() - start_time
     print(f"\nTraining complete in {elapsed:.1f}s")
-    print(f"Best exact match: {best_exact_match:.4f}")
+    print(f"Best val accuracy: {best_acc:.4f}")
     
     # =========================================================================
     # OOD Evaluation with Proper Metrics
@@ -688,11 +523,11 @@ def train_experiment(quick: bool = False):
     model.load_state_dict(torch.load("/outputs/best_model.pt"))
     model.eval()
     
-    def get_model_preds_arc(context_np):
-        """Get model predictions for ARC-style context."""
-        context_t = torch.from_numpy(context_np).to(device)
+    def get_model_preds(inputs_np):
+        """Get model predictions as numpy."""
+        inputs_t = torch.from_numpy(inputs_np).to(device)
         with torch.no_grad():
-            logits = model(context_t)
+            logits = model(inputs_t)
         return logits.argmax(-1).cpu().numpy()
     
     ood_results = {}
@@ -702,25 +537,23 @@ def train_experiment(quick: bool = False):
     for test_size in [16, 24, 32]:
         all_preds = []
         all_targets = []
-        all_test_inputs = []
+        all_inputs = []
         
         for _ in range(val_steps):
-            context, targets, _ = generate_batch_arc_style(
-                batch_size, test_size, n_objects_range, n_train_pairs, rng
-            )
-            preds = get_model_preds_arc(context)
+            inputs, targets = generate_batch(batch_size, test_size, n_objects_range, rng)
+            preds = get_model_preds(inputs)
             all_preds.append(preds)
             all_targets.append(targets)
-            all_test_inputs.append(context[:, -1])  # test_input is last context grid
+            all_inputs.append(inputs)
         
         preds = np.concatenate(all_preds)
         targets = np.concatenate(all_targets)
-        test_inputs = np.concatenate(all_test_inputs)
+        inputs = np.concatenate(all_inputs)
         
         metrics = compute_metrics(preds, targets)
         
-        # Compiled solver (cheats by using target to infer dx,dy)
-        solver_preds = compiled_solver_batch(test_inputs, targets)
+        # Also run compiled solver
+        solver_preds = compiled_solver_batch(inputs, targets)
         solver_metrics = compute_metrics(solver_preds, targets)
         
         ood_results[f"grid_{test_size}x{test_size}"] = {
@@ -737,23 +570,21 @@ def train_experiment(quick: bool = False):
     for n_obj_range in [(1, 4), (5, 7), (8, 10)]:
         all_preds = []
         all_targets = []
-        all_test_inputs = []
+        all_inputs = []
         
         for _ in range(val_steps):
-            context, targets, _ = generate_batch_arc_style(
-                batch_size, grid_size, n_obj_range, n_train_pairs, rng
-            )
-            preds = get_model_preds_arc(context)
+            inputs, targets = generate_batch(batch_size, grid_size, n_obj_range, rng)
+            preds = get_model_preds(inputs)
             all_preds.append(preds)
             all_targets.append(targets)
-            all_test_inputs.append(context[:, -1])
+            all_inputs.append(inputs)
         
         preds = np.concatenate(all_preds)
         targets = np.concatenate(all_targets)
-        test_inputs = np.concatenate(all_test_inputs)
+        inputs = np.concatenate(all_inputs)
         
         metrics = compute_metrics(preds, targets)
-        solver_preds = compiled_solver_batch(test_inputs, targets)
+        solver_preds = compiled_solver_batch(inputs, targets)
         solver_metrics = compute_metrics(solver_preds, targets)
         
         ood_results[f"objects_{n_obj_range[0]}-{n_obj_range[1]}"] = {
@@ -774,21 +605,18 @@ def train_experiment(quick: bool = False):
     print(f"{'='*60}")
     
     # Generate probe data
-    probe_context, probe_targets, probe_translations = generate_batch_arc_style(
-        batch_size * 4, grid_size, n_objects_range, n_train_pairs, rng
-    )
-    probe_preds = get_model_preds_arc(probe_context)
-    probe_test_inputs = probe_context[:, -1]
+    probe_inputs, probe_targets = generate_batch(batch_size * 4, grid_size, n_objects_range, rng)
+    probe_preds = get_model_preds(probe_inputs)
     
-    # Rule consistency probe: does model output match translate(test_input, dx, dy)?
+    # Rule consistency probe
     print("\n--- Rule Consistency Probe ---")
     rule_correct = 0
     rule_total = 0
-    for i in range(len(probe_test_inputs)):
-        dx, dy = probe_translations[i]
-        if dx == 0 and dy == 0:
+    for i in range(len(probe_inputs)):
+        t = infer_translation(probe_inputs[i], probe_targets[i])
+        if t is None:
             continue
-        expected = apply_translation(probe_test_inputs[i], dx, dy)
+        expected = apply_translation(probe_inputs[i], t[0], t[1])
         if np.array_equal(probe_preds[i], expected):
             rule_correct += 1
         rule_total += 1
@@ -796,16 +624,15 @@ def train_experiment(quick: bool = False):
     rule_consistency = rule_correct / rule_total if rule_total > 0 else 0
     print(f"Rule consistency: {rule_consistency:.4f} ({rule_correct}/{rule_total})")
     
-    # Commutation probe: shift all context grids and test_input together
+    # Commutation probe
     print("\n--- Commutation Probe ---")
     shifts = [(1, 0), (0, 1), (2, 2), (-1, -1)]
     base_preds = probe_preds
     
     commutation_scores = []
     for dx, dy in shifts:
-        # Shift all context grids together
-        shifted_context = np.roll(np.roll(probe_context, dx, axis=2), dy, axis=3)
-        preds_of_shifted = get_model_preds_arc(shifted_context)
+        shifted_inputs = np.roll(np.roll(probe_inputs, dx, axis=1), dy, axis=2)
+        preds_of_shifted = get_model_preds(shifted_inputs)
         shifted_preds = np.roll(np.roll(base_preds, dx, axis=1), dy, axis=2)
         match_rate = np.mean(preds_of_shifted == shifted_preds)
         commutation_scores.append(match_rate)
@@ -817,17 +644,16 @@ def train_experiment(quick: bool = False):
     probes_results = {
         'rule_consistency': rule_consistency,
         'commutation_mean': commutation_mean,
-        'commutation_per_shift': {f"shift_{dx}_{dy}": float(s) for (dx, dy), s in zip(shifts, commutation_scores)},
+        'commutation_per_shift': {f"shift_{dx}_{dy}": s for (dx, dy), s in zip(shifts, commutation_scores)},
     }
     
     # Save results
     results = {
         "training": {
-            "best_exact_match": best_exact_match,
+            "best_val_acc": best_acc,
             "epochs": n_epochs,
             "grid_size": grid_size,
-            "n_objects_range": list(n_objects_range),
-            "n_train_pairs": n_train_pairs,
+            "n_objects_range": n_objects_range,
         },
         "ood_evaluation": ood_results,
         "probes": probes_results,
